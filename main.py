@@ -2,10 +2,10 @@ import os
 import logging
 import asyncio
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import TelegramError
 from openai import OpenAI
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+import datetime
 
 # Setup logging
 logging.basicConfig(
@@ -36,6 +36,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 class TelegramBot:
     def __init__(self):
         self.bot_username = None
+        self.last_news_post = None
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a message when the command /start is issued."""
@@ -52,15 +53,15 @@ class TelegramBot:
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a message when the command /help is issued."""
         help_text = """
-Available commands:
+📋 Available commands:
 /start - Start the bot
 /help - Show this help message
 /news - Get latest news
 
-Features:
-• Auto news posting at 9:00 AM
+🔧 Features:
 • Smart chat responses
 • Spam protection
+• Daily news updates
         """
         await update.message.reply_text(help_text)
     
@@ -71,10 +72,10 @@ Features:
             if news_text:
                 await update.message.reply_text(news_text, parse_mode='Markdown')
             else:
-                await update.message.reply_text("Sorry, couldn't fetch news right now.")
+                await update.message.reply_text("❌ Sorry, couldn't fetch news right now.")
         except Exception as e:
             logger.error(f"Error in news command: {e}")
-            await update.message.reply_text("Error fetching news.")
+            await update.message.reply_text("❌ Error fetching news.")
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages."""
@@ -89,12 +90,16 @@ Features:
             
             # Only process messages from the target group
             if chat_id != GROUP_CHAT_ID:
+                logger.info(f"Message from non-target chat: {chat_id}")
                 return
             
             # Check for spam
             if await self.is_spam(text):
                 await self.handle_spam(update, context)
                 return
+            
+            # Auto-post news at 9:00 AM
+            await self.check_auto_news(context)
             
             # Check if we should respond
             if await self.should_respond(text):
@@ -112,7 +117,8 @@ Features:
         
         spam_indicators = [
             'http://', 'https://', 'www.', '.com', 'buy now', 'click here',
-            'free money', 'lottery', 'casino', 'make money fast'
+            'free money', 'lottery', 'casino', 'make money fast', 'earn $',
+            'get rich', 'bitcoin investment', 'crypto investment'
         ]
         
         text_lower = text.lower()
@@ -126,7 +132,7 @@ Features:
             
             # Send warning
             user = update.message.from_user
-            warning = f"⚠️ Warning @{user.username or user.first_name}! Please avoid spam."
+            warning = f"⚠️ Warning @{user.username or user.first_name}! Please avoid spam messages."
             await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text=warning
@@ -147,12 +153,12 @@ Features:
             return True
         
         # Respond to questions
-        question_words = ['?', 'what', 'how', 'why', 'when', 'where', 'who']
+        question_words = ['?', 'what', 'how', 'why', 'when', 'where', 'who', 'tell me', 'explain']
         if any(word in text_lower for word in question_words):
             return True
         
         # Respond to greetings
-        greetings = ['hello bot', 'hi bot', 'hey bot']
+        greetings = ['hello bot', 'hi bot', 'hey bot', 'good morning bot', 'good evening bot']
         if any(greeting in text_lower for greeting in greetings):
             return True
         
@@ -167,7 +173,7 @@ Features:
             Message: {message}
             
             Respond in a friendly, conversational way. Keep it short (1-2 sentences).
-            Be helpful and engaging.
+            Be helpful and engaging. If you don't know something, say so politely.
             """
             
             response = openai_client.chat.completions.create(
@@ -190,62 +196,51 @@ Features:
         """Get news summary from OpenAI."""
         try:
             prompt = """
-            Create a brief daily news summary with 3-5 interesting headlines.
-            Make it engaging and concise. Include emojis.
-            Keep it under 300 characters.
+            Create a brief daily news summary with 3-5 interesting headlines from around the world.
+            Include technology, science, world news, and interesting facts.
+            Make it engaging and concise. Use emojis. Keep it under 400 characters.
             """
             
             response = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "You are a news reporter creating engaging summaries."},
+                    {"role": "system", "content": "You are a news reporter creating engaging daily summaries."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=150,
+                max_tokens=200,
                 temperature=0.7
             )
             
             news = response.choices[0].message.content.strip()
-            return f"📰 **Daily News** 📰\n\n{news}"
+            return f"📰 **Daily News Update** 📰\n\n{news}\n\n#News #Update"
             
         except Exception as e:
             logger.error(f"Error getting news: {e}")
             return None
     
-    async def post_daily_news(self, context: CallbackContext):
-        """Post daily news to the group."""
+    async def check_auto_news(self, context: ContextTypes.DEFAULT_TYPE):
+        """Check if it's time to post auto news."""
         try:
-            logger.info("Posting daily news...")
-            news = await self.get_news_summary()
-            if news:
-                await context.bot.send_message(
-                    chat_id=GROUP_CHAT_ID,
-                    text=news,
-                    parse_mode='Markdown'
-                )
-                logger.info("Daily news posted successfully")
+            now = datetime.datetime.now()
+            current_time = now.strftime("%H:%M")
+            
+            # Post news at 9:00 AM if not posted today
+            if current_time == "09:00" and self.last_news_post != now.date():
+                news = await self.get_news_summary()
+                if news:
+                    await context.bot.send_message(
+                        chat_id=GROUP_CHAT_ID,
+                        text=news,
+                        parse_mode='Markdown'
+                    )
+                    self.last_news_post = now.date()
+                    logger.info("Auto-posted daily news")
         except Exception as e:
-            logger.error(f"Error posting daily news: {e}")
+            logger.error(f"Error in auto news check: {e}")
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors."""
         logger.error(f"Exception while handling an update: {context.error}")
-
-def setup_scheduler(app):
-    """Setup the scheduler for daily tasks."""
-    scheduler = AsyncIOScheduler()
-    
-    # Schedule daily news at 9:00 AM
-    scheduler.add_job(
-        app.bot_data['bot'].post_daily_news,
-        trigger=CronTrigger(hour=9, minute=0),
-        args=[app],
-        id='daily_news'
-    )
-    
-    scheduler.start()
-    logger.info("Scheduler started")
-    return scheduler
 
 async def main():
     """Start the bot."""
@@ -272,9 +267,6 @@ async def main():
         
         # Error handler
         application.add_error_handler(bot.error_handler)
-        
-        # Setup scheduler
-        scheduler = setup_scheduler(application)
         
         # Start polling
         logger.info("Bot is starting polling...")
