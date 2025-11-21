@@ -1,11 +1,10 @@
 import os
 import logging
 import asyncio
+import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.error import TelegramError
 from openai import OpenAI
-import datetime
 
 # Setup logging
 logging.basicConfig(
@@ -223,18 +222,20 @@ class TelegramBot:
         try:
             now = datetime.datetime.now()
             current_time = now.strftime("%H:%M")
+            current_date = now.date()
             
             # Post news at 9:00 AM if not posted today
-            if current_time == "09:00" and self.last_news_post != now.date():
-                news = await self.get_news_summary()
-                if news:
-                    await context.bot.send_message(
-                        chat_id=GROUP_CHAT_ID,
-                        text=news,
-                        parse_mode='Markdown'
-                    )
-                    self.last_news_post = now.date()
-                    logger.info("Auto-posted daily news")
+            if current_time == "09:00":
+                if self.last_news_post != current_date:
+                    news = await self.get_news_summary()
+                    if news:
+                        await context.bot.send_message(
+                            chat_id=GROUP_CHAT_ID,
+                            text=news,
+                            parse_mode='Markdown'
+                        )
+                        self.last_news_post = current_date
+                        logger.info("Auto-posted daily news")
         except Exception as e:
             logger.error(f"Error in auto news check: {e}")
     
