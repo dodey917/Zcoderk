@@ -1,8 +1,8 @@
 import os
 import logging
 import datetime
-from telegram import Update, Bot
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 
 # Setup logging
@@ -36,9 +36,9 @@ class TelegramBot:
         self.bot_username = None
         self.last_news_post = None
     
-    def start(self, update: Update, context: CallbackContext):
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a message when the command /start is issued."""
-        update.message.reply_text(
+        await update.message.reply_text(
             '🤖 Hello! I am your group management bot!\n\n'
             'I can help with:\n'
             '• Monitoring group activity\n'
@@ -48,7 +48,7 @@ class TelegramBot:
             'Add me to your group and make me an admin!'
         )
     
-    def help(self, update: Update, context: CallbackContext):
+    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a message when the command /help is issued."""
         help_text = """
 📋 Available commands:
@@ -61,21 +61,21 @@ class TelegramBot:
 • Spam protection
 • Daily news updates
         """
-        update.message.reply_text(help_text)
+        await update.message.reply_text(help_text)
     
-    def news(self, update: Update, context: CallbackContext):
+    async def news(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Post news to the group."""
         try:
-            news_text = self.get_news_summary()
+            news_text = await self.get_news_summary()
             if news_text:
-                update.message.reply_text(news_text, parse_mode='Markdown')
+                await update.message.reply_text(news_text, parse_mode='Markdown')
             else:
-                update.message.reply_text("❌ Sorry, couldn't fetch news right now.")
+                await update.message.reply_text("❌ Sorry, couldn't fetch news right now.")
         except Exception as e:
             logger.error(f"Error in news command: {e}")
-            update.message.reply_text("❌ Error fetching news.")
+            await update.message.reply_text("❌ Error fetching news.")
     
-    def handle_message(self, update: Update, context: CallbackContext):
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages."""
         try:
             # Ignore messages from bots
@@ -92,23 +92,23 @@ class TelegramBot:
                 return
             
             # Check for spam
-            if self.is_spam(text):
-                self.handle_spam(update, context)
+            if await self.is_spam(text):
+                await self.handle_spam(update, context)
                 return
             
             # Auto-post news at 9:00 AM
-            self.check_auto_news(context)
+            await self.check_auto_news(context)
             
             # Check if we should respond
-            if self.should_respond(text):
-                response = self.generate_response(text, update.message.from_user.first_name)
+            if await self.should_respond(text):
+                response = await self.generate_response(text, update.message.from_user.first_name)
                 if response:
-                    update.message.reply_text(response)
+                    await update.message.reply_text(response)
                     
         except Exception as e:
             logger.error(f"Error handling message: {e}")
     
-    def is_spam(self, text: str) -> bool:
+    async def is_spam(self, text: str) -> bool:
         """Check if message contains spam."""
         if not text:
             return False
@@ -122,16 +122,16 @@ class TelegramBot:
         text_lower = text.lower()
         return any(indicator in text_lower for indicator in spam_indicators)
     
-    def handle_spam(self, update: Update, context: CallbackContext):
+    async def handle_spam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle spam messages."""
         try:
             # Delete the spam message
-            update.message.delete()
+            await update.message.delete()
             
             # Send warning
             user = update.message.from_user
             warning = f"⚠️ Warning @{user.username or user.first_name}! Please avoid spam messages."
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text=warning
             )
@@ -139,7 +139,7 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Error handling spam: {e}")
     
-    def should_respond(self, text: str) -> bool:
+    async def should_respond(self, text: str) -> bool:
         """Determine if bot should respond to message."""
         if not text or len(text.strip()) < 3:
             return False
@@ -162,7 +162,7 @@ class TelegramBot:
         
         return False
     
-    def generate_response(self, message: str, username: str) -> str:
+    async def generate_response(self, message: str, username: str) -> str:
         """Generate AI response using OpenAI."""
         try:
             prompt = f"""
@@ -190,7 +190,7 @@ class TelegramBot:
             logger.error(f"Error generating AI response: {e}")
             return None
     
-    def get_news_summary(self) -> str:
+    async def get_news_summary(self) -> str:
         """Get news summary from OpenAI."""
         try:
             prompt = """
@@ -216,7 +216,7 @@ class TelegramBot:
             logger.error(f"Error getting news: {e}")
             return None
     
-    def check_auto_news(self, context: CallbackContext):
+    async def check_auto_news(self, context: ContextTypes.DEFAULT_TYPE):
         """Check if it's time to post auto news."""
         try:
             now = datetime.datetime.now()
@@ -226,9 +226,9 @@ class TelegramBot:
             # Post news at 9:00 AM if not posted today
             if current_time == "09:00":
                 if self.last_news_post != current_date:
-                    news = self.get_news_summary()
+                    news = await self.get_news_summary()
                     if news:
-                        context.bot.send_message(
+                        await context.bot.send_message(
                             chat_id=GROUP_CHAT_ID,
                             text=news,
                             parse_mode='Markdown'
@@ -238,7 +238,7 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Error in auto news check: {e}")
     
-    def error_handler(self, update: Update, context: CallbackContext):
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors."""
         logger.error(f"Exception while handling an update: {context.error}")
 
@@ -247,31 +247,32 @@ def main():
     try:
         logger.info("Initializing bot...")
         
-        # Create updater
-        updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
-        dispatcher = updater.dispatcher
+        # Create application - FIXED: Use create_application pattern
+        application = (
+            Application.builder()
+            .token(TELEGRAM_BOT_TOKEN)
+            .concurrent_updates(True)
+            .build()
+        )
         
         # Initialize bot instance
         bot = TelegramBot()
         
-        # Get bot username
-        bot_info = updater.bot.get_me()
-        bot.bot_username = bot_info.username
-        logger.info(f"Bot username: @{bot.bot_username}")
-        
         # Add handlers
-        dispatcher.add_handler(CommandHandler("start", bot.start))
-        dispatcher.add_handler(CommandHandler("help", bot.help))
-        dispatcher.add_handler(CommandHandler("news", bot.news))
-        dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, bot.handle_message))
+        application.add_handler(CommandHandler("start", bot.start))
+        application.add_handler(CommandHandler("help", bot.help))
+        application.add_handler(CommandHandler("news", bot.news))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
         
         # Error handler
-        dispatcher.add_error_handler(bot.error_handler)
+        application.add_error_handler(bot.error_handler)
         
         # Start polling
         logger.info("Bot is starting polling...")
-        updater.start_polling()
-        updater.idle()
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
         
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
