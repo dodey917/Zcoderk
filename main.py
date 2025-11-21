@@ -1,13 +1,14 @@
 import os
 import logging
-import requests
+import asyncio
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext
+from telegram.error import TelegramError
 from openai import OpenAI
-import schedule
-import time
-import threading
-from datetime import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import html
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -19,7 +20,15 @@ logger = logging.getLogger(__name__)
 # Get credentials from environment variables
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-GROUP_CHAT_ID = os.getenv('GROUP_CHAT_ID')  # Your group chat ID
+GROUP_CHAT_ID = os.getenv('GROUP_CHAT_ID')
+
+# Validate environment variables
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable is required")
+if not GROUP_CHAT_ID:
+    raise ValueError("GROUP_CHAT_ID environment variable is required")
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -30,51 +39,92 @@ class TelegramGroupManager:
         
     async def initialize_bot(self, application):
         """Get bot username"""
-        bot_info = await application.bot.get_me()
-        self.bot_username = bot_info.username
-        logger.info(f"Bot initialized: @{self.bot_username}")
+        try:
+            bot_info = await application.bot.get_me()
+            self.bot_username = bot_info.username
+            logger.info(f"Bot initialized: @{self.bot_username}")
+            
+            # Set commands
+            await self.set_bot_commands(application)
+            
+        except Exception as e:
+            logger.error(f"Error initializing bot: {e}")
+
+    async def set_bot_commands(self, application):
+        """Set bot commands menu"""
+        commands = [
+            ("start", "Start the bot"),
+            ("help", "Show help message"),
+            ("news", "Get latest news"),
+            ("rules", "Show group rules"),
+        ]
+        await application.bot.set_my_commands(commands)
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
-        await update.message.reply_text(
-            "🤖 Hello! I'm your group management bot. I can:\n"
-            "• Monitor group activity\n"
-            "• Post daily news\n"
-            "• Respond to messages intelligently\n"
-            "• Keep the group safe from spam\n\n"
-            "Add me to your group and make me an admin for full functionality!"
-        )
+        try:
+            await update.message.reply_text(
+                "🤖 Hello! I'm your group management bot!\n\n"
+                "I can help with:\n"
+                "• 📰 Posting daily news\n"
+                "• 🛡️ Monitoring group activity\n"
+                "• 💬 Smart chat responses\n"
+                "• 🚫 Spam protection\n\n"
+                "Use /help to see all commands!"
+            )
+        except Exception as e:
+            logger.error(f"Error in start_command: {e}")
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
         help_text = """
 📋 **Available Commands:**
+
 /start - Start the bot
 /help - Show this help message
 /news - Get latest news summary
 /rules - Show group rules
-/stats - Group statistics (admin only)
 
 🔧 **Auto Features:**
-• Daily news posting
+• Daily news at 9:00 AM
 • Smart chat responses
 • Spam protection
 • Content moderation
-        """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
 
-    async def post_news_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Post news to group"""
-        if str(update.effective_chat.id) != GROUP_CHAT_ID:
-            return
-            
-        news = await self.get_news_summary()
-        if news:
-            await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=news,
-                parse_mode='Markdown'
-            )
+Add me to your group and make me an admin for full functionality!
+        """
+        try:
+            await update.message.reply_text(help_text, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Error in help_command: {e}")
+
+    async def news_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /news command"""
+        try:
+            news_message = await update.message.reply_text("📰 Fetching latest news...")
+            news = await self.get_news_summary()
+            await news_message.edit_text(news if news else "❌ Could not fetch news at the moment.")
+        except Exception as e:
+            logger.error(f"Error in news_command: {e}")
+            await update.message.reply_text("❌ Error fetching news.")
+
+    async def rules_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /rules command"""
+        rules_text = """
+📜 **Group Rules:**
+
+1. Be respectful to all members
+2. No spam or self-promotion
+3. No offensive content
+4. Keep discussions relevant
+5. Follow Telegram's ToS
+
+Violations may result in warnings or removal.
+        """
+        try:
+            await update.message.reply_text(rules_text, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Error in rules_command: {e}")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle all incoming messages"""
@@ -84,42 +134,54 @@ class TelegramGroupManager:
                 return
 
             message = update.message
-            chat_id = message.chat_id
+            chat_id = str(message.chat_id)
             text = message.text or message.caption or ""
 
             # Only respond in the designated group
-            if str(chat_id) != GROUP_CHAT_ID:
+            if chat_id != GROUP_CHAT_ID:
+                logger.info(f"Message from non-target chat: {chat_id}")
                 return
 
-            # Check if bot is mentioned or message is a reply to bot
-            should_respond = (
-                self.bot_username and f"@{self.bot_username}" in text
-                or (message.reply_to_message and 
-                    message.reply_to_message.from_user.username == self.bot_username)
-                or await self.should_respond_to_message(text)
-            )
+            # Log the message
+            user = message.from_user
+            logger.info(f"Message from {user.first_name} (@{user.username}): {text}")
 
-            if should_respond:
-                response = await self.generate_ai_response(text, message.from_user.first_name)
+            # Check for spam/inappropriate content
+            if await self.is_inappropriate_content(text):
+                await self.handle_inappropriate_content(update, context)
+                return
+
+            # Check if bot should respond
+            if await self.should_respond(update, text):
+                response = await self.generate_ai_response(text, user.first_name)
                 if response:
                     await message.reply_text(response)
-
-            # Monitor for inappropriate content
-            await self.monitor_content(update, context)
 
         except Exception as e:
             logger.error(f"Error handling message: {e}")
 
-    async def should_respond_to_message(self, text: str) -> bool:
+    async def should_respond(self, update: Update, text: str) -> bool:
         """Determine if bot should respond to a message"""
-        if not text.strip():
+        if not text or len(text.strip()) < 5:
             return False
 
-        # Check for questions or direct addressing
-        triggers = ['?', 'what', 'how', 'why', 'when', 'where', 'who', 'tell me', 'explain']
         text_lower = text.lower()
         
-        return any(trigger in text_lower for trigger in triggers) and len(text) > 10
+        # Check if bot is mentioned
+        if self.bot_username and f"@{self.bot_username}" in text_lower:
+            return True
+
+        # Check for questions
+        question_indicators = ['?', 'what', 'how', 'why', 'when', 'where', 'who', 'tell me', 'explain', 'help with']
+        if any(indicator in text_lower for indicator in question_indicators):
+            return True
+
+        # Check for greetings directed at bot
+        greetings = ['hello bot', 'hi bot', 'hey bot', 'good morning bot', 'good evening bot']
+        if any(greeting in text_lower for greeting in greetings):
+            return True
+
+        return False
 
     async def generate_ai_response(self, user_message: str, user_name: str) -> str:
         """Generate AI response using OpenAI"""
@@ -130,16 +192,16 @@ class TelegramGroupManager:
             Message: {user_message}
             
             Respond in a friendly, conversational tone. Keep responses concise (1-2 sentences max). 
-            If it's a question, answer helpfully. If it's just a statement, respond appropriately.
+            Be helpful and engaging. If you don't know something, say so politely.
             """
             
             response = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "You're a friendly group chat assistant. Be concise and helpful."},
+                    {"role": "system", "content": "You're a friendly and helpful group chat assistant. Keep responses short and natural."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=150,
+                max_tokens=100,
                 temperature=0.7
             )
             
@@ -174,108 +236,134 @@ class TelegramGroupManager:
             
         except Exception as e:
             logger.error(f"Error getting news: {e}")
-            return "❌ Could not fetch news at the moment. Please try again later."
+            return None
 
-    async def monitor_content(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Monitor messages for inappropriate content"""
+    async def is_inappropriate_content(self, text: str) -> bool:
+        """Check if message contains inappropriate content"""
+        if not text:
+            return False
+
+        text_lower = text.lower()
+        
+        inappropriate_patterns = [
+            'http://', 'https://', 'www.', '.com', 'buy now', 'click here',
+            'free money', 'lottery', 'casino', 'make money fast', 'work from home',
+            'earn $', 'get rich', 'bitcoin investment', 'crypto investment'
+        ]
+        
+        return any(pattern in text_lower for pattern in inappropriate_patterns)
+
+    async def handle_inappropriate_content(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inappropriate content"""
         try:
             message = update.message
-            text = (message.text or message.caption or "").lower()
-
-            # List of inappropriate words/phrases (you can expand this)
-            inappropriate_words = [
-                'spam', 'http://', 'https://', 'www.', '.com', 'buy now',
-                'click here', 'free money', 'lottery', 'casino'
-            ]
-
-            # Check for spammy content
-            if any(word in text for word in inappropriate_words):
-                # Delete the message
-                await message.delete()
-                
-                # Warn the user
-                warning_msg = (
-                    f"⚠️ Warning @{message.from_user.username or message.from_user.first_name}!\n"
-                    "Please avoid posting spam or promotional content in this group."
-                )
-                await context.bot.send_message(
-                    chat_id=message.chat_id,
-                    text=warning_msg
-                )
-                logger.info(f"Deleted spam message from user {message.from_user.id}")
-
+            user = message.from_user
+            
+            # Delete the message
+            await message.delete()
+            
+            # Send warning
+            warning_msg = (
+                f"⚠️ Warning @{user.username or user.first_name}!\n"
+                "Please avoid posting promotional or spam content in this group."
+            )
+            await context.bot.send_message(
+                chat_id=message.chat_id,
+                text=warning_msg
+            )
+            
+            logger.info(f"Deleted inappropriate message from user {user.id}")
+            
         except Exception as e:
-            logger.error(f"Error monitoring content: {e}")
+            logger.error(f"Error handling inappropriate content: {e}")
 
-    async def post_daily_news(self, application):
+    async def post_daily_news(self, context: CallbackContext):
         """Post daily news to the group"""
         try:
+            logger.info("Posting daily news...")
             news = await self.get_news_summary()
             if news:
-                await application.bot.send_message(
+                await context.bot.send_message(
                     chat_id=GROUP_CHAT_ID,
                     text=news,
                     parse_mode='Markdown'
                 )
                 logger.info("Daily news posted successfully")
+            else:
+                logger.error("Failed to generate news")
         except Exception as e:
             logger.error(f"Error posting daily news: {e}")
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors"""
-        logger.error(f"Update {update} caused error {context.error}")
+        try:
+            logger.error(f"Exception while handling an update: {context.error}")
+            
+            # Log the update that caused the error
+            if update:
+                update_dict = update.to_dict() if update else {}
+                logger.error(f"Update that caused error: {update_dict}")
+        except Exception as e:
+            logger.error(f"Error in error_handler: {e}")
 
-def schedule_daily_tasks(application, group_manager):
-    """Schedule daily tasks"""
-    def run_scheduler():
-        # Schedule daily news at 9:00 AM
-        schedule.every().day.at("09:00").do(
-            lambda: asyncio.run_coroutine_threadsafe(
-                group_manager.post_daily_news(application), 
-                application.create_task
-            )
+def setup_scheduler(application):
+    """Setup scheduled tasks"""
+    scheduler = AsyncIOScheduler()
+    
+    # Schedule daily news at 9:00 AM
+    scheduler.add_job(
+        application.bot_data['group_manager'].post_daily_news,
+        trigger=CronTrigger(hour=9, minute=0),
+        args=[application],
+        id='daily_news'
+    )
+    
+    scheduler.start()
+    return scheduler
+
+async def main():
+    """Start the bot"""
+    try:
+        logger.info("Starting bot...")
+        
+        # Create application
+        application = (
+            Application.builder()
+            .token(TELEGRAM_BOT_TOKEN)
+            .build()
         )
 
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
+        # Initialize group manager
+        group_manager = TelegramGroupManager()
+        application.bot_data['group_manager'] = group_manager
 
-    # Start scheduler in a separate thread
-    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
+        # Add handlers
+        application.add_handler(CommandHandler("start", group_manager.start_command))
+        application.add_handler(CommandHandler("help", group_manager.help_command))
+        application.add_handler(CommandHandler("news", group_manager.news_command))
+        application.add_handler(CommandHandler("rules", group_manager.rules_command))
+        application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, group_manager.handle_message))
+        
+        # Error handler
+        application.add_error_handler(group_manager.error_handler)
 
-async def post_manual_news(application):
-    """Manual news posting function"""
-    group_manager = TelegramGroupManager()
-    await group_manager.post_daily_news(application)
+        # Initialize bot
+        await group_manager.initialize_bot(application)
 
-def main():
-    """Start the bot"""
-    if not all([TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, GROUP_CHAT_ID]):
-        raise ValueError("Please set all required environment variables")
-    
-    # Create application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    group_manager = TelegramGroupManager()
+        # Setup scheduler
+        scheduler = setup_scheduler(application)
+        logger.info("Scheduler started")
 
-    # Add handlers
-    application.add_handler(CommandHandler("start", group_manager.start_command))
-    application.add_handler(CommandHandler("help", group_manager.help_command))
-    application.add_handler(CommandHandler("news", group_manager.post_news_command))
-    application.add_handler(MessageHandler(filters.ALL, group_manager.handle_message))
-    
-    # Error handler
-    application.add_error_handler(group_manager.error_handler)
+        # Start polling
+        logger.info("Bot is now polling...")
+        await application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
 
-    # Initialize bot
-    application.post_init(group_manager.initialize_bot)
-
-    # Start scheduled tasks
-    schedule_daily_tasks(application, group_manager)
-
-    # Start the Bot
-    logger.info("Bot is starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        raise
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
